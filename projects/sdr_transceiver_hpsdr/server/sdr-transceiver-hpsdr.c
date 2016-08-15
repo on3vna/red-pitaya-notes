@@ -1,5 +1,12 @@
 /* 19.04.2016 DC2PD : add code for bandpass and antenna switching via I2C. */
 
+/***************************************************************************/
+/* 21/7/2016  ON3VNA : ALSA sound device becomes unavailable due to buffer */
+/*                     underruns.                                          */
+/* 15/8/2016  ON3VNA : make shure int for USB goes to second core          */
+/*                     Change SHED_RR for shound thread                    */
+/***************************************************************************/
+
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -16,6 +23,17 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <syslog.h>
+ 
+#include <errno.h>
+#include <poll.h>
+#include <alsa/asoundlib.h>
+	      
+snd_pcm_t *playback_handle;
+#define pcmframes 4096
+char buf[pcmframes*4];
+char buffernull[pcmframes*4];
+int sound_avail=0;
 
 #include "jack/ringbuffer.c"
 
@@ -36,6 +54,7 @@ const uint32_t freq_min = 0;
 const uint32_t freq_max = 61440000;
 
 int receivers = 1;
+int sound =0;
 
 int sock_ep2;
 struct sockaddr_in addr_ep6;
@@ -46,8 +65,10 @@ int active_thread = 0;
 void process_ep2(uint8_t *frame);
 void *handler_ep6(void *arg);
 void *handler_playback(void *arg);
+int ini_sound();
 
 jack_ringbuffer_t *playback_data = 0;
+unsigned long jack_space;	/* ON3VNA : USB audio   */
 
 /* variables to handle PCA9555 board */
 int i2c_fd;
@@ -146,6 +167,10 @@ int main(int argc, char *argv[])
   int fd, i;
   ssize_t size;
   pthread_t thread;
+  long policy;
+  struct sched_param prio;
+  pthread_attr_t attr;
+ 
   volatile void *cfg, *sts;
   char *name = "/dev/mem";
   uint8_t buffer[1032];
@@ -154,7 +179,9 @@ int main(int argc, char *argv[])
   struct sockaddr_in addr_ep2, addr_from;
   socklen_t size_from;
   int yes = 1;
-
+ 
+  openlog ("sdr-transceiver-hpsdr-main", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL0);
+  syslog (LOG_NOTICE, "Program sdr-transceiver-hpsdr started by User %d", getuid ());
   if((fd = open(name, O_RDWR)) < 0)
   {
     perror("open");
@@ -249,8 +276,18 @@ int main(int argc, char *argv[])
     perror("bind");
     return EXIT_FAILURE;
   }
-
-  playback_data = jack_ringbuffer_create(262144);
+  /*************************************************************************/
+  /* ON3VNA :                                                              */
+  /* We can recieve upto 1800UDP packets per second from the HPSDR program */
+  /* running on the PC.                                                    */
+  /*************************************************************************/
+  playback_data = jack_ringbuffer_create(16000000L); 
+  /* define scheduling properties for sound thread */
+  pthread_attr_init ( &attr );
+  pthread_attr_setinheritsched ( &attr, PTHREAD_EXPLICIT_SCHED );
+  policy = SCHED_RR;
+  pthread_attr_setschedpolicy ( &attr, policy );
+  
   if(pthread_create(&thread, NULL, handler_playback, NULL) < 0)
   {
     perror("pthread_create");
@@ -270,10 +307,41 @@ int main(int argc, char *argv[])
 
     switch(*(uint32_t *)buffer)
     {
-      case 0x0201feef:
-        while(*tx_cntr > 16258) usleep(1000);
+
+	  case 0x0201feef:
+		if (sound_avail)
+		{
+			/* BEGIN ON3VNA : Check if space in the jack buffer else drop this frames */
+			/*                otherwhise we may overwrite the read ptr                */
+			jack_space=jack_ringbuffer_write_space(playback_data);
+			if (jack_space>2016L)
+			{
+				for(i = 0; i < 504; i += 8)
+				{
+					jack_ringbuffer_write(playback_data, buffer + 16 + i, 4);	
+				}					
+			}
+			else
+			{
+				syslog (LOG_ERR, "not enough space to copy frames in jackbuffer \n");
+			}
+			jack_space=jack_ringbuffer_write_space(playback_data);
+			if (jack_space>2016L)
+			{
+				for(i = 0; i < 504; i += 8) 
+				{
+					jack_ringbuffer_write(playback_data, buffer + 528 + i, 4);
+				}
+			}
+			else
+			{
+				syslog (LOG_ERR, "not enough space to copy frames in jackbuffer \n");				
+			}
+			/* END ON3VNA : Check if space in the jack buffer else drop this frames */  
+		}
+		while(*tx_cntr > 16258) usleep(1000);
         if(*tx_cntr == 0) for(i = 0; i < 16258; ++i) *tx_data = 0;
-        if((*gpio_out & 1) | (*gpio_in & 1))
+		if((*gpio_out & 1) | (*gpio_in & 1))
         {
           for(i = 0; i < 504; i += 8) *tx_data = *(uint32_t *)(buffer + 20 + i);
           for(i = 0; i < 504; i += 8) *tx_data = *(uint32_t *)(buffer + 532 + i);
@@ -282,8 +350,7 @@ int main(int argc, char *argv[])
         {
           for(i = 0; i < 126; ++i) *tx_data = 0;
         }
-        for(i = 0; i < 504; i += 8) jack_ringbuffer_write(playback_data, buffer + 16 + i, 4);
-        for(i = 0; i < 504; i += 8) jack_ringbuffer_write(playback_data, buffer + 528 + i, 4);
+
         process_ep2(buffer + 11);
         process_ep2(buffer + 523);
         break;
@@ -319,7 +386,8 @@ int main(int argc, char *argv[])
   }
 
   close(sock_ep2);
-
+  closelog ();
+  
   return EXIT_SUCCESS;
 }
 
@@ -582,19 +650,185 @@ void *handler_ep6(void *arg)
 
   return NULL;
 }
-
+int ini_sound()
+{
+		snd_pcm_hw_params_t *hw_params;
+		snd_pcm_sw_params_t *sw_params;
+		int nfds;
+		int err;
+		struct pollfd *pfds;
+		static char *device = "default";                        /* playback device */
+		unsigned int actualRate = 48000;
+  /********************************************************************************/
+  /* BEGIN ON3VNA : make shure we keep the ALSA alive and have 192000 bytes/sec   */
+  /*                other whise we have buffer underrun from the USB sound device */
+  /*                192000 bytes/sec is not feasable                              */
+  /********************************************************************************/
+		if ((err = snd_pcm_open (&playback_handle, device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) 
+		{
+			syslog (LOG_ERR, "No USB audio sound device available\n");
+			return (0);
+		}   
+		if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot allocate hardware parameter structure \n");
+			return (0);
+		}		 
+		if ((err = snd_pcm_hw_params_any (playback_handle, hw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot initialize hardware parameter structure \n");
+			return (0);
+		}
+		if ((err = snd_pcm_hw_params_set_access (playback_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set access type \n");
+			return (0);
+		}	
+		if ((err = snd_pcm_hw_params_set_format (playback_handle, hw_params, SND_PCM_FORMAT_S16_BE)) < 0) 
+		{
+						syslog (LOG_ERR, "cannot set sample format \n");
+			return (0);
+		}	
+		if ((err = snd_pcm_hw_params_set_rate_near (playback_handle, hw_params, &actualRate, 0)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set sample rate \n");
+			return (0);
+		}	
+		if ((err = snd_pcm_hw_params_set_channels (playback_handle, hw_params, 2)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set channel count \n");
+			return (0);
+		}
+	
+		if ((err = snd_pcm_hw_params (playback_handle, hw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set hw_params parameters \n");
+			return (0);
+		}	
+		snd_pcm_hw_params_free (hw_params);
+		if ((err = snd_pcm_sw_params_malloc (&sw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot allocate software parameters structure \n");
+			return (0);
+		}
+		if ((err = snd_pcm_sw_params_current (playback_handle, sw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot initialize software parameters structure \n");
+			return (0);
+		}
+		if ((err = snd_pcm_sw_params_set_avail_min (playback_handle, sw_params, pcmframes)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set minimum available frames count \n");
+			return (0);
+		}
+		if ((err = snd_pcm_sw_params_set_start_threshold (playback_handle, sw_params, 0U)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set start mode \n");
+			return (0);
+		}
+		if ((err = snd_pcm_sw_params (playback_handle, sw_params)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot set software parameters sw_params \n");
+			return (0);
+		}
+		/* the interface will interrupt the kernel every pcmframes frames, and ALSA
+		   will wake up this program very soon after that.
+		*/
+		if ((err = snd_pcm_prepare (playback_handle)) < 0) 
+		{
+			syslog (LOG_ERR, "cannot prepare audio interface for use \n");
+			return (0);
+		}
+		return (1);
+}	
 void *handler_playback(void *arg)
 {
-  uint8_t buffer[65536];
+		int err;
+		openlog ("sdr-transceiver-hpsdr-handler-playback", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL0);
+		syslog (LOG_NOTICE, "Program sdr-transceiver-hpsdr-handler-playback started by User %d", getuid ());
+		
+		snd_pcm_sframes_t frames_to_deliver;
+		sound_avail=ini_sound();
+		while (sound_avail) 
+		{
 
-  while(1)
-  {
-    if(jack_ringbuffer_read_space(playback_data) < 65536)
-    {
-      while(jack_ringbuffer_read_space(playback_data) < 196608) usleep(1000);
-    }
-    jack_ringbuffer_read(playback_data, buffer, 65536);
-    fwrite(buffer, 1, 65536, stdout);
-  }
+			/* wait till the interface is ready for data, or 1 second
+			   has elapsed.
+			*/
+				if ((err = snd_pcm_wait (playback_handle, 1000)) < 0) 
+				{
+					syslog (LOG_ERR, "poll failed\n");
+			        break;
+				}	           
+			/* find out how much space is available for playback data */
+	
+				if ((frames_to_deliver = snd_pcm_avail_update (playback_handle)) < 0)
+				{
+					if (frames_to_deliver == -EPIPE) 
+					{
+						syslog (LOG_ERR, "an xrun occured\n");						
+						break;
+					} 
+					else 
+					{
+						syslog (LOG_ERR, "unknown ALSA avail update return value \n");
+						break;
+					}
+				}
+				frames_to_deliver = frames_to_deliver > pcmframes ? pcmframes : frames_to_deliver;
+				/* deliver the data */
+				if (playback_callback (frames_to_deliver) != frames_to_deliver) 
+				{
+			        	syslog (LOG_ERR, "playback callback failed try recover \n");
+						if ((err = snd_pcm_prepare (playback_handle)) < 0)
+						{
+							syslog (LOG_ERR, "recover failed\n");
+						}	
+					break;
+				}
+		}
+  /**************/
+  /*END ON3VNA  */
+  /**************/
+ 
   return NULL;
+}
+int playback_callback (snd_pcm_sframes_t nframes)
+{
+	int err;
+	long bytes_avail;
+	
+	bytes_avail=jack_ringbuffer_read_space(playback_data);
+	if (bytes_avail >= 4*nframes)
+	{
+		/* printf ("playback callback called with %u frames\n", nframes); */
+	
+		/* ... fill buf with data ... */
+		jack_ringbuffer_read(playback_data, buf, 4*nframes);
+		if ((err = snd_pcm_writei (playback_handle, buf, nframes)) < 0) 
+		{
+			syslog (LOG_ERR, "writei failed\n");
+		}
+		
+	}
+	else
+	{
+		/**********************************************/
+		/* ON3VNA: no frames are comming from the PC  */
+		/*         because we are stopped on the PC   */
+		/*         or we changed config enable VAC    */
+		/*         So keep the device alive and send  */
+		/*         null to the sound device           */
+		/*         If we dont do so we have cracking  */
+		/*         noise until PC sends back frames   */
+		/**********************************************/
+		/*syslog (LOG_ERR, "Not enough data in jackbuffer send nullbuffer \n");*/
+		if ((err = snd_pcm_writei (playback_handle, buffernull, nframes)) < 0) 
+		{
+			syslog (LOG_ERR, "writei null frames failed\n");
+		}	
+	}
+
+	
+	return err;
 }
