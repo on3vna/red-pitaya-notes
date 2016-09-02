@@ -2,6 +2,7 @@
 19.04.2016 DC2PD: add code for bandpass and antenna switching via I2C.
 22.08.2016 DL4AOI: add code for TX level switching via I2C.
 22.08.2016 DL4AOI: output first four open collector outputs to the pins DIO4_P - DIO7_P of the extension connector E1
+02/09/2016 ON3VNA: drive level via DS1803-10 I2C
 */
 
 #include <stdio.h>
@@ -30,6 +31,9 @@
 #define ADDR_PENE 0x20 /* PCA9555 address 0 */
 #define ADDR_ALEX 0x21 /* PCA9555 address 1 */
 #define ADDR_DRIVE 0x22 /* PCA9555 address 2 */
+
+#define ADDR_DRIVE_DS 0x28 /* DS1803           */
+
 
 volatile uint32_t *rx_freq[4], *rx_rate, *tx_freq, *alex, *tx_mux;
 volatile uint16_t *rx_cntr, *tx_cntr, *tx_level;
@@ -62,6 +66,8 @@ int i2c_level = 0;
 uint16_t i2c_pene_data = 0;
 uint16_t i2c_alex_data = 0;
 uint16_t i2c_level_data = 0;
+/* drive via ds1803 */
+int i2c_drive = 0;
 
 uint8_t tx_mux_data = 0;
 uint8_t rx_att_data = 0;
@@ -73,6 +79,17 @@ ssize_t i2c_write(int fd, uint8_t addr, uint16_t data)
   buffer[1] = data;
   buffer[2] = data >> 8;
   return write(fd, buffer, 3);
+}
+/*******************************************************/
+/* ON3VNA: implement variable drive with DS1803        */
+/*******************************************************/
+uint8_t  i2c_drive_data =0;
+ssize_t i2c_write_pot(int fd, uint8_t addr, uint8_t data)
+{
+  uint8_t buffer[2];
+  buffer[0] = addr;
+  buffer[1] = data;
+  return write(fd, buffer, 2);
 }
 
 uint16_t alex_data_rx = 0;
@@ -204,7 +221,14 @@ int main(int argc, char *argv[])
         i2c_write(i2c_fd, 0x06, 0x0000);
       }
     }
-  }
+    if(ioctl(i2c_fd, I2C_SLAVE, ADDR_DRIVE_DS) >= 0)
+    {
+      if(i2c_write_pot(i2c_fd, 0xAF, 0x00) > 0)
+      {
+        i2c_drive = 1;
+        i2c_write_pot(i2c_fd, 0xAF, 0x00);
+      }
+    }  }
 
   sts = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0x40000000);
   cfg = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0x40001000);
@@ -381,6 +405,7 @@ void process_ep2(uint8_t *frame)
   uint8_t cw_reversed, cw_speed, cw_mode, cw_weight, cw_spacing;
   uint8_t cw_internal, cw_volume, cw_delay;
   uint16_t cw_hang, cw_freq;
+  uint8_t drive_level;	/* ON3VNA 19/8/2016 Implement drive level */
 
   switch(frame[0])
   {
@@ -512,6 +537,17 @@ void process_ep2(uint8_t *frame)
       {
         *tx_level = (data + 1) * 128 - 1;
       }
+	  if(i2c_drive)
+	  {
+	  	drive_level=frame[1];
+		if (i2c_drive_data != drive_level)
+		{
+			i2c_drive_data =drive_level;
+			ioctl(i2c_fd, I2C_SLAVE, ADDR_DRIVE_DS);
+			i2c_write_pot(i2c_fd, 0xAF, drive_level);
+        }
+      }
+	  
       break;
     case 20:
     case 21:
